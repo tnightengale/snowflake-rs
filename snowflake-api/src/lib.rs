@@ -478,23 +478,30 @@ impl SnowflakeApi {
                     schema: resp.data.rowtype.into_iter().map(Into::into).collect(),
                 }))
             } else if !resp.data.chunks.is_empty() {
-                // Empty inline rowset but chunks exist — fetch Arrow data from chunks
-                log::debug!("Got empty inline rowset with {} chunks, fetching Arrow data", resp.data.chunks.len());
-                let mut chunks = try_join_all(resp.data.chunks.iter().map(|chunk| {
+                // Empty inline rowset but chunks exist — fetch chunked JSON data
+                log::debug!("Got empty inline rowset with {} chunks, fetching JSON chunks", resp.data.chunks.len());
+                let chunk_bytes = try_join_all(resp.data.chunks.iter().map(|chunk| {
                     self.connection
                         .get_chunk(&chunk.url, &resp.data.chunk_headers)
                 }))
                 .await?;
 
-                // Include base64 inline data if present
-                if let Some(base64) = resp.data.rowset_base64 {
-                    if !base64.is_empty() {
-                        let bytes = Bytes::from(base64::engine::general_purpose::STANDARD.decode(base64)?);
-                        chunks.push(bytes);
+                // Parse each chunk as a JSON array and concatenate all rows
+                let mut all_rows: Vec<serde_json::Value> = Vec::new();
+                for bytes in &chunk_bytes {
+                    let text = String::from_utf8_lossy(bytes);
+                    if let Ok(serde_json::Value::Array(rows)) = serde_json::from_str(&text) {
+                        all_rows.extend(rows);
+                    } else {
+                        log::warn!("Failed to parse chunk as JSON array, chunk size: {}", bytes.len());
                     }
                 }
 
-                Ok(RawQueryResult::Bytes(chunks))
+                log::debug!("Fetched {} rows from {} JSON chunks", all_rows.len(), chunk_bytes.len());
+                Ok(RawQueryResult::Json(JsonResult {
+                    value: serde_json::Value::Array(all_rows),
+                    schema: resp.data.rowtype.into_iter().map(Into::into).collect(),
+                }))
             } else {
                 // Empty rowset, no chunks — treat as JSON result
                 log::debug!("Got empty JSON response");
