@@ -465,15 +465,44 @@ impl SnowflakeApi {
         if resp.data.returned == 0 {
             log::debug!("Got response with 0 rows");
             Ok(RawQueryResult::Empty)
-        } else if let Some(value) = resp.data.rowset {
-            log::debug!("Got JSON response");
-            // NOTE: json response could be chunked too. however, go clients should receive arrow by-default,
-            // unless user sets session variable to return json. This case was added for debugging and status
-            // information being passed through that fields.
-            Ok(RawQueryResult::Json(JsonResult {
-                value,
-                schema: resp.data.rowtype.into_iter().map(Into::into).collect(),
-            }))
+        } else if let Some(ref value) = resp.data.rowset {
+            // Check if rowset has actual data or is just an empty placeholder.
+            // When Snowflake returns chunked results, rowset may be Some([]) with
+            // all data in S3 chunks. In that case, fall through to chunk fetching.
+            let is_empty_rowset = value.as_array().map_or(false, |a| a.is_empty());
+
+            if !is_empty_rowset {
+                log::debug!("Got JSON response");
+                Ok(RawQueryResult::Json(JsonResult {
+                    value: resp.data.rowset.unwrap(),
+                    schema: resp.data.rowtype.into_iter().map(Into::into).collect(),
+                }))
+            } else if !resp.data.chunks.is_empty() {
+                // Empty inline rowset but chunks exist — fetch Arrow data from chunks
+                log::debug!("Got empty inline rowset with {} chunks, fetching Arrow data", resp.data.chunks.len());
+                let mut chunks = try_join_all(resp.data.chunks.iter().map(|chunk| {
+                    self.connection
+                        .get_chunk(&chunk.url, &resp.data.chunk_headers)
+                }))
+                .await?;
+
+                // Include base64 inline data if present
+                if let Some(base64) = resp.data.rowset_base64 {
+                    if !base64.is_empty() {
+                        let bytes = Bytes::from(base64::engine::general_purpose::STANDARD.decode(base64)?);
+                        chunks.push(bytes);
+                    }
+                }
+
+                Ok(RawQueryResult::Bytes(chunks))
+            } else {
+                // Empty rowset, no chunks — treat as JSON result
+                log::debug!("Got empty JSON response");
+                Ok(RawQueryResult::Json(JsonResult {
+                    value: resp.data.rowset.unwrap(),
+                    schema: resp.data.rowtype.into_iter().map(Into::into).collect(),
+                }))
+            }
         } else if let Some(base64) = resp.data.rowset_base64 {
             // fixme: is it possible to give streaming interface?
             let mut chunks = try_join_all(resp.data.chunks.iter().map(|chunk| {
