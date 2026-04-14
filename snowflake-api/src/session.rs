@@ -12,8 +12,8 @@ use crate::external_browser;
 #[cfg(feature = "cert-auth")]
 use crate::requests::{CertLoginRequest, CertRequestData};
 use crate::requests::{
-    ClientEnvironment, LoginRequest, LoginRequestCommon, PasswordLoginRequest, PasswordRequestData,
-    RenewSessionRequest, SessionParameters,
+    ClientEnvironment, ExternalBrowserRequestData, LoginRequest, LoginRequestCommon,
+    PasswordLoginRequest, PasswordRequestData, RenewSessionRequest, SessionParameters,
 };
 use crate::responses::AuthResponse;
 
@@ -413,61 +413,16 @@ impl Session {
         .await
         .map_err(|e| AuthError::ExternalBrowserError(e.to_string()))?;
 
-        // Build login request body with the SAML token
-        let mut login_data = serde_json::json!({
-            "data": {
-                "ACCOUNT_NAME": self.account_identifier,
-                "LOGIN_NAME": self.username,
-                "AUTHENTICATOR": "EXTERNALBROWSER",
-                "TOKEN": result.token,
-            }
-        });
-        if let Some(proof_key) = result.proof_key {
-            login_data["data"]["PROOF_KEY"] = serde_json::json!(proof_key);
-        }
+        let body = LoginRequest {
+            data: ExternalBrowserRequestData {
+                login_request_common: self.login_request_common(),
+                authenticator: "EXTERNALBROWSER".to_string(),
+                token: result.token,
+                proof_key: result.proof_key,
+            },
+        };
 
-        let mut get_params = Vec::new();
-        if let Some(warehouse) = &self.warehouse {
-            get_params.push(("warehouse", warehouse.as_str()));
-        }
-        if let Some(database) = &self.database {
-            get_params.push(("databaseName", database.as_str()));
-        }
-        if let Some(schema) = &self.schema {
-            get_params.push(("schemaName", schema.as_str()));
-        }
-        if let Some(role) = &self.role {
-            get_params.push(("roleName", role.as_str()));
-        }
-
-        let resp = self
-            .connection
-            .request::<AuthResponse>(
-                QueryType::LoginRequest,
-                &self.account_identifier,
-                &get_params,
-                None,
-                login_data,
-            )
-            .await?;
-
-        match resp {
-            AuthResponse::Login(lr) => {
-                let session_token = AuthToken::new(&lr.data.token, lr.data.validity_in_seconds);
-                let master_token =
-                    AuthToken::new(&lr.data.master_token, lr.data.master_validity_in_seconds);
-                Ok(AuthTokens {
-                    session_token,
-                    master_token,
-                    sequence_id: 0,
-                })
-            }
-            AuthResponse::Error(e) => Err(AuthError::AuthFailed(
-                e.code.unwrap_or_default(),
-                e.message.unwrap_or_default(),
-            )),
-            _ => Err(AuthError::UnexpectedResponse),
-        }
+        self.create(body).await
     }
 
     fn login_request_common(&self) -> LoginRequestCommon {

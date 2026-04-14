@@ -63,6 +63,19 @@ pub struct CertRequestData {
 }
 
 #[derive(Serialize, Debug)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub struct ExternalBrowserRequestData {
+    #[serde(flatten)]
+    pub login_request_common: LoginRequestCommon,
+    pub authenticator: String,
+    pub token: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proof_key: Option<String>,
+}
+
+pub type ExternalBrowserLoginRequest = LoginRequest<ExternalBrowserRequestData>;
+
+#[derive(Serialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct RenewSessionRequest {
     pub old_session_token: String,
