@@ -39,6 +39,7 @@ use crate::responses::{ExecResponseRowType, SnowflakeType};
 use crate::session::AuthError::MissingEnvArgument;
 
 pub mod connection;
+mod external_browser;
 #[cfg(feature = "polars")]
 mod polars;
 mod put;
@@ -223,6 +224,9 @@ impl AuthArgs {
 pub enum AuthType {
     Password(PasswordArgs),
     Certificate(CertificateArgs),
+    /// External browser (SSO/SAML) authentication.
+    /// Opens a browser for the user to authenticate with their IdP.
+    ExternalBrowser,
 }
 
 pub struct PasswordArgs {
@@ -275,6 +279,15 @@ impl SnowflakeApiBuilder {
                 &self.auth.username,
                 self.auth.role.as_deref(),
                 &args.private_key_pem,
+            ),
+            AuthType::ExternalBrowser => Session::externalbrowser_auth(
+                Arc::clone(&connection),
+                &self.auth.account_identifier,
+                self.auth.warehouse.as_deref(),
+                self.auth.database.as_deref(),
+                self.auth.schema.as_deref(),
+                &self.auth.username,
+                self.auth.role.as_deref(),
             ),
         };
 

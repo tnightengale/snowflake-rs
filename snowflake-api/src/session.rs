@@ -8,6 +8,7 @@ use thiserror::Error;
 
 use crate::connection;
 use crate::connection::{Connection, QueryType};
+use crate::external_browser;
 #[cfg(feature = "cert-auth")]
 use crate::requests::{CertLoginRequest, CertRequestData};
 use crate::requests::{
@@ -50,6 +51,9 @@ pub enum AuthError {
 
     #[error("Enable the cert-auth feature to use certificate authentication")]
     CertAuthNotEnabled,
+
+    #[error("External browser authentication error: {0}")]
+    ExternalBrowserError(String),
 }
 
 #[derive(Debug)]
@@ -105,6 +109,7 @@ impl AuthToken {
 enum AuthType {
     Certificate,
     Password,
+    ExternalBrowser,
 }
 
 /// Requests, caches, and renews authentication tokens.
@@ -208,6 +213,41 @@ impl Session {
         }
     }
 
+    /// Authenticate using external browser (SSO/SAML).
+    ///
+    /// Opens a browser for the user to authenticate with their identity provider.
+    /// A localhost listener receives the SAML token callback.
+    #[allow(clippy::too_many_arguments)]
+    pub fn externalbrowser_auth(
+        connection: Arc<Connection>,
+        account_identifier: &str,
+        warehouse: Option<&str>,
+        database: Option<&str>,
+        schema: Option<&str>,
+        username: &str,
+        role: Option<&str>,
+    ) -> Self {
+        let account_identifier = account_identifier.to_uppercase();
+        let database = database.map(str::to_uppercase);
+        let schema = schema.map(str::to_uppercase);
+        let username = username.to_uppercase();
+        let role = role.map(str::to_uppercase);
+
+        Self {
+            connection,
+            auth_tokens: Mutex::new(None),
+            auth_type: AuthType::ExternalBrowser,
+            account_identifier,
+            warehouse: warehouse.map(str::to_uppercase),
+            database,
+            username,
+            role,
+            schema,
+            private_key_pem: None,
+            password: None,
+        }
+    }
+
     /// Get cached token or request a new one if old one has expired.
     pub async fn get_token(&self) -> Result<AuthParts, AuthError> {
         let mut auth_tokens = self.auth_tokens.lock().await;
@@ -229,6 +269,10 @@ impl Session {
                 AuthType::Password => {
                     log::info!("Starting session with password authentication");
                     self.create(self.passwd_request_body()?).await
+                }
+                AuthType::ExternalBrowser => {
+                    log::info!("Starting session with external browser authentication");
+                    self.create_with_external_browser().await
                 }
             }?;
             *auth_tokens = Some(tokens);
@@ -346,6 +390,72 @@ impl Session {
                 let master_token =
                     AuthToken::new(&lr.data.master_token, lr.data.master_validity_in_seconds);
 
+                Ok(AuthTokens {
+                    session_token,
+                    master_token,
+                    sequence_id: 0,
+                })
+            }
+            AuthResponse::Error(e) => Err(AuthError::AuthFailed(
+                e.code.unwrap_or_default(),
+                e.message.unwrap_or_default(),
+            )),
+            _ => Err(AuthError::UnexpectedResponse),
+        }
+    }
+
+    /// Run external browser flow, then create session via login-request with the SAML token.
+    async fn create_with_external_browser(&self) -> Result<AuthTokens, AuthError> {
+        let result = external_browser::run_external_browser_flow(
+            &self.account_identifier,
+            &self.username,
+        )
+        .await
+        .map_err(|e| AuthError::ExternalBrowserError(e.to_string()))?;
+
+        // Build login request body with the SAML token
+        let mut login_data = serde_json::json!({
+            "data": {
+                "ACCOUNT_NAME": self.account_identifier,
+                "LOGIN_NAME": self.username,
+                "AUTHENTICATOR": "EXTERNALBROWSER",
+                "TOKEN": result.token,
+            }
+        });
+        if let Some(proof_key) = result.proof_key {
+            login_data["data"]["PROOF_KEY"] = serde_json::json!(proof_key);
+        }
+
+        let mut get_params = Vec::new();
+        if let Some(warehouse) = &self.warehouse {
+            get_params.push(("warehouse", warehouse.as_str()));
+        }
+        if let Some(database) = &self.database {
+            get_params.push(("databaseName", database.as_str()));
+        }
+        if let Some(schema) = &self.schema {
+            get_params.push(("schemaName", schema.as_str()));
+        }
+        if let Some(role) = &self.role {
+            get_params.push(("roleName", role.as_str()));
+        }
+
+        let resp = self
+            .connection
+            .request::<AuthResponse>(
+                QueryType::LoginRequest,
+                &self.account_identifier,
+                &get_params,
+                None,
+                login_data,
+            )
+            .await?;
+
+        match resp {
+            AuthResponse::Login(lr) => {
+                let session_token = AuthToken::new(&lr.data.token, lr.data.validity_in_seconds);
+                let master_token =
+                    AuthToken::new(&lr.data.master_token, lr.data.master_validity_in_seconds);
                 Ok(AuthTokens {
                     session_token,
                     master_token,
